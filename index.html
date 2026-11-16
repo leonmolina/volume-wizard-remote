@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#7c4dff" />
+    <title>Volume Wizard remote</title>
+    <link rel="icon" href="icon.png" />
+    <link rel="apple-touch-icon" href="icon.png" />
+    <link rel="stylesheet" href="remote.css" />
+  </head>
+  <body>
+    <header class="header">
+      <img class="logo" src="icon.png" alt="" width="28" height="28" />
+      <h1>Volume Wizard</h1>
+      <span class="connection" id="connection" data-state="connecting">Connecting…</span>
+    </header>
+
+    <main>
+      <section class="message" id="message" hidden>
+        <p id="message-text"></p>
+        <button class="pill" id="retry" type="button" hidden>Try again</button>
+      </section>
+
+      <section id="content" hidden>
+        <div class="toolbar">
+          <h2>Tabs playing audio</h2>
+          <button
+            class="pill"
+            id="solo"
+            type="button"
+            aria-pressed="false"
+            title="Mute every other tab and keep the tab on your computer's screen playing"
+          >
+            Current only
+          </button>
+        </div>
+        <ul class="tabs" id="tabs"></ul>
+        <p class="empty" id="empty" hidden>No tabs are playing audio on your computer.</p>
+      </section>
+    </main>
+
+    <!-- Sets the global Peer used by remote.js. -->
+    <script src="vendor/peerjs.min.js"></script>
+    <script type="module" src="remote.js"></script>
+  </body>
+</html>
