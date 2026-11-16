@@ -81,14 +81,35 @@ function showContent() {
 }
 
 // ---------- connection ----------
+//
+// One connection attempt at a time. The PeerJS broker is only needed to set
+// up the data connection: once the extension has accepted us, broker problems
+// are ignored. Phones cut network connections in the background, so a
+// heartbeat (and a check when the page comes back) replaces a dead connection.
+
+const PING_INTERVAL_MS = 4000;
+const SILENCE_LIMIT_MS = 10000; // nothing heard for this long while visible: connection is dead
+const RESUME_CHECK_MS = 2500; // after coming back, wait this long for an answer to a ping
+const CONNECT_TIMEOUT_MS = 15000;
+const QUICK_DROP_MS = 5000; // dropped this soon after connecting: back off before retrying
+
+// Identifies this page to the extension, which closes this phone's older
+// connections when it reconnects.
+const phoneId = [...crypto.getRandomValues(new Uint8Array(8))]
+  .map((b) => b.toString(16).padStart(2, '0'))
+  .join('');
 
 let pairing = null;
 let peer = null;
-let conn = null;
+let conn = null; // the connection the extension accepted
 let accepted = false;
+let acceptedAt = 0;
 let denied = false;
+let connecting = false;
 let attempt = 0;
 let reconnectTimer = null;
+let heartbeatTimer = null;
+let lastHeard = 0;
 let nextRequestId = 1;
 const pending = new Map(); // request id → { resolve, reject, timer }
 
@@ -108,78 +129,155 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(connect, delay);
 }
 
-function connect() {
-  clearTimeout(reconnectTimer);
-  if (denied) return;
-  setConnection('connecting', 'Connecting…');
-  if (!peer || peer.destroyed) {
-    peer = new Peer({ debug: 0 });
-    peer.on('open', openConnection);
-    peer.on('disconnected', () => {
-      if (!peer.destroyed) peer.reconnect();
-    });
-    peer.on('error', (error) => {
-      if (error.type === 'peer-unavailable') {
-        setConnection('error', 'Computer offline');
-        if (!accepted) {
-          showMessage(
-            "Can't reach your computer. Check that Chrome is open there and that Phone remote is on in Volume Wizard's settings.",
-            { retry: true },
-          );
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+  ]);
+}
+
+// An open Peer, registered with the broker. One that lost the broker (e.g.
+// while the phone was asleep) is replaced by a fresh one with a new ID, since
+// re-registering the old ID can fail with "ID taken" and destroy it.
+function openPeer() {
+  if (peer?.open && !peer.destroyed) return Promise.resolve(peer);
+  peer?.destroy();
+  const p = new Peer({ debug: 0 });
+  peer = p;
+  return new Promise((resolve, reject) => {
+    p.once('open', () => resolve(p));
+    p.once('error', reject);
+  });
+}
+
+// Opens a data connection to the extension and waits until it accepts the key.
+function openDataConnection(p) {
+  return new Promise((resolve, reject) => {
+    const c = p.connect(pairing.peerId, { reliable: true });
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      p.off('error', onPeerError);
+      fn(value);
+    };
+    const fail = (error) => {
+      settle(reject, error);
+      c.close();
+    };
+    const timer = setTimeout(() => fail(new Error('timeout')), CONNECT_TIMEOUT_MS);
+    // "peer-unavailable" (computer offline) is reported on the Peer, not the connection.
+    const onPeerError = (error) => fail(error);
+    p.on('error', onPeerError);
+
+    c.on('open', () => c.send({ type: 'hello', key: pairing.key, phone: phoneId }));
+    c.on('data', (message) => {
+      if (!settled) {
+        if (message?.type === 'welcome') settle(resolve, c);
+        else if (message?.type === 'denied') {
+          denied = true;
+          fail(new Error('denied'));
         }
-      } else {
-        setConnection('error', 'Connection problem');
+        return;
       }
-      scheduleReconnect();
+      if (c === conn) {
+        lastHeard = Date.now();
+        handleMessage(message);
+      }
     });
-  } else if (peer.open) {
-    openConnection();
-  } else if (peer.disconnected) {
-    peer.reconnect();
+    const closed = () => {
+      if (!settled) fail(new Error('closed'));
+      else if (c === conn) connectionLost();
+    };
+    c.on('close', closed);
+    c.on('error', closed);
+  });
+}
+
+async function connect() {
+  clearTimeout(reconnectTimer);
+  if (denied || connecting || accepted || !pairing) return;
+  // Not while the page is in the background: the extension would drop a
+  // silent phone again anyway. Coming back to the page reconnects.
+  if (document.visibilityState === 'hidden') return;
+  connecting = true;
+  setConnection('connecting', attempt > 0 || !els.content.hidden ? 'Reconnecting…' : 'Connecting…');
+  try {
+    const p = await withTimeout(openPeer(), CONNECT_TIMEOUT_MS);
+    conn = await openDataConnection(p);
+    accepted = true;
+    acceptedAt = Date.now();
+    lastHeard = acceptedAt;
+    setConnection('connected', 'Connected');
+    startHeartbeat();
+    refresh();
+  } catch (error) {
+    if (denied) {
+      setConnection('error', 'Not paired');
+      showMessage('This link is no longer valid. Scan the QR code in Volume Wizard’s settings again.');
+      return;
+    }
+    if (error?.type === 'peer-unavailable') {
+      setConnection('error', 'Computer offline');
+      if (els.content.hidden) {
+        showMessage(
+          "Can't reach your computer. Check that Chrome is open there and that Phone remote is on in Volume Wizard's settings.",
+          { retry: true },
+        );
+      }
+    } else {
+      // A broker or network problem: start from a fresh Peer next time.
+      peer?.destroy();
+      peer = null;
+      setConnection('connecting', 'Reconnecting…');
+    }
+    scheduleReconnect();
+  } finally {
+    connecting = false;
   }
 }
 
-function openConnection() {
-  conn?.close();
-  const current = peer.connect(pairing.peerId, { reliable: true });
-  conn = current;
+function connectionLost() {
+  if (!accepted) return;
+  accepted = false;
+  const old = conn;
+  conn = null;
+  old?.close();
+  stopHeartbeat();
+  failPending('Disconnected');
+  setConnection('connecting', 'Reconnecting…');
+  if (Date.now() - acceptedAt < QUICK_DROP_MS) {
+    scheduleReconnect(); // something keeps dropping it: don't hammer
+  } else {
+    attempt = 0;
+    connect();
+  }
+}
 
-  current.on('open', () => current.send({ type: 'hello', key: pairing.key }));
-  current.on('data', (message) => {
-    if (current !== conn) return;
-    handleMessage(message);
-  });
-  const closed = () => {
-    if (current !== conn) return;
-    accepted = false;
-    failPending('Disconnected');
-    if (!denied) {
-      setConnection('connecting', 'Reconnecting…');
-      scheduleReconnect();
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    // Phones throttle hidden pages; the check on coming back covers that time.
+    if (!accepted || document.visibilityState !== 'visible') return;
+    if (Date.now() - lastHeard > SILENCE_LIMIT_MS) {
+      connectionLost();
+      return;
     }
-  };
-  current.on('close', closed);
-  current.on('error', closed);
+    conn.send({ type: 'ping' });
+  }, PING_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  clearInterval(heartbeatTimer);
 }
 
 function handleMessage(message) {
-  if (message?.type === 'welcome') {
-    accepted = true;
-    attempt = 0;
-    setConnection('connected', 'Connected');
-    refresh();
-    return;
-  }
-  if (message?.type === 'denied') {
-    denied = true;
-    setConnection('error', 'Not paired');
-    showMessage('This link is no longer valid. Scan the QR code in Volume Wizard’s settings again.');
-    return;
-  }
   if (message?.type === 'changed') {
     scheduleRefresh();
     return;
   }
+  if (message?.type === 'pong') return; // lastHeard is already updated
   const request = pending.get(message?.id);
   if (!request) return;
   pending.delete(message.id);
@@ -204,12 +302,25 @@ function request(type, params = {}) {
   });
 }
 
-// A phone asleep loses the connection; reconnect as soon as it's back.
+// Coming back to the page: reconnect, or check the connection survived.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !accepted && !denied && pairing) {
+  if (document.visibilityState !== 'visible' || !pairing || denied) return;
+  if (!accepted) {
     attempt = 0;
     connect();
+    return;
   }
+  const sentAt = Date.now();
+  lastHeard = sentAt - 1; // so only an answer from now on counts
+  try {
+    conn.send({ type: 'ping' });
+  } catch {
+    connectionLost();
+    return;
+  }
+  setTimeout(() => {
+    if (accepted && lastHeard < sentAt) connectionLost();
+  }, RESUME_CHECK_MS);
 });
 
 els.retry.addEventListener('click', () => {
