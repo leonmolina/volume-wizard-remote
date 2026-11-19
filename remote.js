@@ -109,7 +109,24 @@ const hasWebRTC = typeof RTCPeerConnection !== 'undefined';
 let diagnosis = null; // { step, ice, gathering, candidates } for the current attempt
 
 function startDiagnosis() {
-  diagnosis = { step: 'service', ice: '-', gathering: '-', candidates: {} };
+  diagnosis = { step: 'service', started: Date.now(), ice: '-', gathering: '-', candidates: {}, remote: null, serviceLost: null };
+}
+
+// Which addresses the computer sent, read just before giving up: none means
+// they never arrived (the service dropped first); some means they did but no
+// pair of addresses worked, so only a relay (TURN) server would help.
+async function recordRemoteCandidates(pc) {
+  const d = diagnosis;
+  if (!pc || !d || pc.signalingState === 'closed') return;
+  try {
+    const remote = {};
+    (await pc.getStats()).forEach((report) => {
+      if (report.type === 'remote-candidate') remote[report.candidateType] = (remote[report.candidateType] ?? 0) + 1;
+    });
+    d.remote = remote;
+  } catch {
+    // Stats unavailable: the details show "-".
+  }
 }
 
 // Records which kinds of network addresses the phone found (host: local,
@@ -129,18 +146,26 @@ function watchIce(pc) {
 
 function failedStep(error) {
   if (!hasWebRTC || error?.type === 'browser-incompatible') return 'webrtc';
+  const step = diagnosis?.step ?? 'service';
+  // Losing the service after it already put us in touch with the computer
+  // means the direct connection never finished: that is the step to report.
+  if (SERVICE_ERRORS.has(error?.type) && step === 'direct') return 'direct';
   if (SERVICE_ERRORS.has(error?.type)) return 'service';
-  return diagnosis?.step ?? 'service';
+  return step;
 }
 
 function diagnosisDetails(step, error) {
   const d = diagnosis ?? {};
-  const candidates = ['host', 'srflx', 'relay'].map((type) => `${type} ${d.candidates?.[type] ?? 0}`).join(', ');
+  const count = (found) =>
+    found ? ['host', 'srflx', 'relay'].map((type) => `${type} ${found[type] ?? 0}`).join(', ') : '-';
+  const seconds = (at) => (at ? `${((at - d.started) / 1000).toFixed(1)}s` : '-');
   return [
     `Step: ${step}`,
     `Error: ${error?.type || error?.message || error || '-'}`,
     `ICE: ${d.ice ?? '-'} (gathering ${d.gathering ?? '-'})`,
-    `Candidates: ${candidates}`,
+    `Candidates: ${count(d.candidates)}`,
+    `Computer candidates: ${count(d.remote)}`,
+    `Service lost after: ${seconds(d.serviceLost)}`,
     `WebRTC: ${hasWebRTC ? 'yes' : 'no'} · Online: ${navigator.onLine ? 'yes' : 'no'}`,
     `Browser: ${navigator.userAgent}`,
   ].join('\n');
@@ -234,8 +259,10 @@ function openPeer() {
 function openDataConnection(p) {
   return new Promise((resolve, reject) => {
     const c = p.connect(pairing.peerId, { reliable: true });
-    watchIce(c.peerConnection);
+    const pc = c.peerConnection;
+    watchIce(pc);
     let settled = false;
+    let failing = false;
     const settle = (fn, value) => {
       if (settled) return;
       settled = true;
@@ -243,14 +270,29 @@ function openDataConnection(p) {
       p.off('error', onPeerError);
       fn(value);
     };
-    const fail = (error) => {
+    const fail = async (error) => {
+      if (settled || failing) return;
+      failing = true;
+      await recordRemoteCandidates(pc);
+      if (settled) return; // accepted while the stats were read
       settle(reject, error);
       c.close();
     };
     const timer = setTimeout(() => fail(new Error('timeout')), CONNECT_TIMEOUT_MS);
-    // "peer-unavailable" (computer offline) is reported on the Peer, not the connection.
-    const onPeerError = (error) => fail(error);
+    // "peer-unavailable" (computer offline) is reported on the Peer, not the
+    // connection. Losing the service is not fatal here: it has already passed
+    // our offer on, and the direct connection may still finish without it.
+    const onPeerError = (error) => {
+      if (SERVICE_ERRORS.has(error?.type)) {
+        if (diagnosis && !diagnosis.serviceLost) diagnosis.serviceLost = Date.now();
+        return;
+      }
+      fail(error);
+    };
     p.on('error', onPeerError);
+    pc?.addEventListener('iceconnectionstatechange', () => {
+      if (pc.iceConnectionState === 'failed') fail(Object.assign(new Error('Direct connection failed'), { type: 'ice-failed' }));
+    });
 
     c.on('open', () => {
       if (diagnosis) diagnosis.step = 'handshake';
