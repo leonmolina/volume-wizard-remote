@@ -100,6 +100,19 @@ h1 {
   margin-bottom: 0;
 }
 
+.problem {
+  margin-bottom: 14px;
+  color: var(--text);
+}
+
+.problem .details {
+  color: var(--muted);
+  font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: left;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
 /* ---------- toolbar ---------- */
 
 .toolbar {

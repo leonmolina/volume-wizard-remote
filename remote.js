@@ -31,6 +31,10 @@ const els = {
   message: $('message'),
   messageText: $('message-text'),
   retry: $('retry'),
+  problem: $('problem'),
+  problemText: $('problem-text'),
+  problemDetails: $('problem-details'),
+  problemRetry: $('problem-retry'),
   content: $('content'),
   solo: $('solo'),
   tabs: $('tabs'),
@@ -78,6 +82,82 @@ function showMessage(text, { retry = false } = {}) {
 function showContent() {
   els.message.hidden = true;
   els.content.hidden = false;
+}
+
+// ---------- diagnosis ----------
+//
+// Each connection attempt records how far it got, so a failure can say which
+// step is broken instead of only "Reconnecting…": a screenshot of the phone is
+// then enough to tell a blocked service from a network that blocks WebRTC.
+
+const PROBLEMS = {
+  webrtc:
+    "This browser can't make direct connections (WebRTC is off or missing). On iPhone, Lockdown Mode can cause this. Try Safari, with Lockdown Mode off.",
+  service:
+    "Can't reach the connection service (0.peerjs.com). A VPN, ad or DNS blocker, iCloud Private Relay or a network filter on this phone may be blocking it. Turn those off, or try another network.",
+  direct:
+    "Found your computer, but couldn't connect to it directly. This network may block it: switch between Wi-Fi and mobile data, or turn off any VPN.",
+  handshake:
+    "Reached your computer, but Volume Wizard didn't answer. Turn Phone remote off and on again in its settings.",
+};
+
+// PeerJS errors that mean the broker connection itself failed.
+const SERVICE_ERRORS = new Set(['network', 'server-error', 'socket-error', 'socket-closed', 'disconnected']);
+
+const hasWebRTC = typeof RTCPeerConnection !== 'undefined';
+
+let diagnosis = null; // { step, ice, gathering, candidates } for the current attempt
+
+function startDiagnosis() {
+  diagnosis = { step: 'service', ice: '-', gathering: '-', candidates: {} };
+}
+
+// Records which kinds of network addresses the phone found (host: local,
+// srflx: public via STUN, relay: via TURN) and how far the link got.
+function watchIce(pc) {
+  const d = diagnosis;
+  if (!pc || !d) return;
+  d.ice = pc.iceConnectionState;
+  d.gathering = pc.iceGatheringState;
+  pc.addEventListener('icecandidate', ({ candidate }) => {
+    const type = candidate?.type ?? /\btyp (\w+)/.exec(candidate?.candidate ?? '')?.[1];
+    if (type) d.candidates[type] = (d.candidates[type] ?? 0) + 1;
+  });
+  pc.addEventListener('iceconnectionstatechange', () => (d.ice = pc.iceConnectionState));
+  pc.addEventListener('icegatheringstatechange', () => (d.gathering = pc.iceGatheringState));
+}
+
+function failedStep(error) {
+  if (!hasWebRTC || error?.type === 'browser-incompatible') return 'webrtc';
+  if (SERVICE_ERRORS.has(error?.type)) return 'service';
+  return diagnosis?.step ?? 'service';
+}
+
+function diagnosisDetails(step, error) {
+  const d = diagnosis ?? {};
+  const candidates = ['host', 'srflx', 'relay'].map((type) => `${type} ${d.candidates?.[type] ?? 0}`).join(', ');
+  return [
+    `Step: ${step}`,
+    `Error: ${error?.type || error?.message || error || '-'}`,
+    `ICE: ${d.ice ?? '-'} (gathering ${d.gathering ?? '-'})`,
+    `Candidates: ${candidates}`,
+    `WebRTC: ${hasWebRTC ? 'yes' : 'no'} · Online: ${navigator.onLine ? 'yes' : 'no'}`,
+    `Browser: ${navigator.userAgent}`,
+  ].join('\n');
+}
+
+function showProblem(step, error) {
+  const details = diagnosisDetails(step, error);
+  console.warn(`Volume Wizard remote: connection failed\n${details}`);
+  els.problemText.textContent = PROBLEMS[step];
+  els.problemDetails.textContent = details;
+  els.problem.hidden = false;
+  // Replaces "Connecting to your computer…"; a tab list already shown stays.
+  if (els.content.hidden) els.message.hidden = true;
+}
+
+function hideProblem() {
+  els.problem.hidden = true;
 }
 
 // ---------- connection ----------
@@ -154,6 +234,7 @@ function openPeer() {
 function openDataConnection(p) {
   return new Promise((resolve, reject) => {
     const c = p.connect(pairing.peerId, { reliable: true });
+    watchIce(c.peerConnection);
     let settled = false;
     const settle = (fn, value) => {
       if (settled) return;
@@ -171,7 +252,10 @@ function openDataConnection(p) {
     const onPeerError = (error) => fail(error);
     p.on('error', onPeerError);
 
-    c.on('open', () => c.send({ type: 'hello', key: pairing.key, phone: phoneId }));
+    c.on('open', () => {
+      if (diagnosis) diagnosis.step = 'handshake';
+      c.send({ type: 'hello', key: pairing.key, phone: phoneId });
+    });
     c.on('data', (message) => {
       if (!settled) {
         if (message?.type === 'welcome') settle(resolve, c);
@@ -203,22 +287,27 @@ async function connect() {
   if (document.visibilityState === 'hidden') return;
   connecting = true;
   setConnection('connecting', attempt > 0 || !els.content.hidden ? 'Reconnecting…' : 'Connecting…');
+  startDiagnosis();
   try {
     const p = await withTimeout(openPeer(), CONNECT_TIMEOUT_MS);
+    diagnosis.step = 'direct';
     conn = await openDataConnection(p);
     accepted = true;
     acceptedAt = Date.now();
     lastHeard = acceptedAt;
     setConnection('connected', 'Connected');
+    hideProblem();
     startHeartbeat();
     refresh();
   } catch (error) {
     if (denied) {
+      hideProblem();
       setConnection('error', 'Not paired');
       showMessage('This link is no longer valid. Scan the QR code in Volume Wizard’s settings again.');
       return;
     }
     if (error?.type === 'peer-unavailable') {
+      hideProblem();
       setConnection('error', 'Computer offline');
       if (els.content.hidden) {
         showMessage(
@@ -227,6 +316,12 @@ async function connect() {
         );
       }
     } else {
+      const step = failedStep(error);
+      showProblem(step, error);
+      if (step === 'webrtc') {
+        setConnection('error', 'Not supported');
+        return; // retrying can't help
+      }
       // A broker or network problem: start from a fresh Peer next time.
       peer?.destroy();
       peer = null;
@@ -323,10 +418,12 @@ document.addEventListener('visibilitychange', () => {
   }, RESUME_CHECK_MS);
 });
 
-els.retry.addEventListener('click', () => {
+function retryNow() {
   attempt = 0;
   connect();
-});
+}
+els.retry.addEventListener('click', retryNow);
+els.problemRetry.addEventListener('click', retryNow);
 
 // ---------- tab list ----------
 
@@ -553,6 +650,10 @@ if (!pairing) {
   showMessage(
     'To pair this phone, open Volume Wizard on your computer, go to Settings, turn on Phone remote and scan the QR code.',
   );
+} else if (!hasWebRTC) {
+  setConnection('error', 'Not supported');
+  startDiagnosis();
+  showProblem('webrtc');
 } else {
   showMessage('Connecting to your computer…');
   connect();
